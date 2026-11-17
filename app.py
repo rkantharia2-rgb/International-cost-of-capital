@@ -30,30 +30,38 @@ BONDS_URL = "https://tradingeconomics.com/bonds"
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_oecd_tax_table():
-    """Official OECD SDMX CSV: combined statutory CIT, general government, latest year."""
+    """OECD SDMX official data endpoint; 2026 standard statutory CIT, general government."""
     codes = {"United States":"USA","Canada":"CAN","United Kingdom":"GBR","Germany":"DEU",
              "France":"FRA","Japan":"JPN","Australia":"AUS","Mexico":"MEX",
              "Poland":"POL","Switzerland":"CHE","Ireland":"IRL","Netherlands":"NLD",
              "Italy":"ITA","Spain":"ESP","Sweden":"SWE","Norway":"NOR",
              "Denmark":"DNK","South Korea":"KOR","Portugal":"PRT","Colombia":"COL"}
-    url = "https://sdmx.oecd.org/public/rest/v1/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/" + "+".join(codes.values()) + ".A..ST..S13...?startPeriod=2025&endPeriod=2026"
-    response = requests.get(url, headers={"Accept":"csvfile","User-Agent":"InternationalCostOfCapital/1.0"}, timeout=30)
+    # Official OECD Data Explorer API uses /rest/data (not /rest/v1/data).
+    # Query shape is based on the dataset's own Developer API query builder.
+    url = ("https://sdmx.oecd.org/public/rest/data/"
+           "OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/.A..ST..S13...?"
+           "startPeriod=2025&dimensionAtObservation=AllDimensions&format=csvfile")
+    response = requests.get(url, headers={"Accept":"text/csv", "User-Agent":"Mozilla/5.0"}, timeout=25)
     response.raise_for_status()
     frame = pd.read_csv(io.StringIO(response.text))
-    required = {'REF_AREA','TIME_PERIOD','OBS_VALUE'}
+    required = {"REF_AREA", "TIME_PERIOD", "OBS_VALUE"}
     if not required.issubset(frame.columns):
-        raise ValueError('OECD SDMX response did not include expected CSV columns')
-    frame['OBS_VALUE'] = pd.to_numeric(frame['OBS_VALUE'], errors='coerce')
-    frame['TIME_PERIOD'] = pd.to_numeric(frame['TIME_PERIOD'], errors='coerce')
-    frame = frame.dropna(subset=['OBS_VALUE','TIME_PERIOD']).sort_values('TIME_PERIOD')
+        raise ValueError(f"OECD columns changed: {list(frame.columns)[:12]}")
+    frame = frame[frame["REF_AREA"].isin(codes.values())].copy()
+    frame["OBS_VALUE"] = pd.to_numeric(frame["OBS_VALUE"], errors="coerce")
+    frame["TIME_PERIOD"] = pd.to_numeric(frame["TIME_PERIOD"], errors="coerce")
+    frame = frame.dropna(subset=["OBS_VALUE", "TIME_PERIOD"])
+    # Only accept one observation per country-year; otherwise the rate type is ambiguous.
+    latest = frame["TIME_PERIOD"].max()
+    frame = frame[frame["TIME_PERIOD"] == latest]
+    if frame["REF_AREA"].duplicated().any():
+        raise ValueError("OECD returned multiple tax measures per country; refusing ambiguous rates")
     reverse = {v:k for k,v in codes.items()}
-    found = {}
-    for code, group in frame.groupby('REF_AREA'):
-        if code in reverse:
-            value = float(group.iloc[-1]['OBS_VALUE'])
-            if 0 <= value <= 60: found[reverse[code]] = value
-    if 'United States' not in found: raise ValueError('OECD API did not return US combined statutory rate')
-    return found, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    found = {reverse[r.REF_AREA]:float(r.OBS_VALUE) for r in frame.itertuples()
+             if r.REF_AREA in reverse and 0 <= float(r.OBS_VALUE) <= 60}
+    if "United States" not in found:
+        raise ValueError("OECD response did not include US statutory rate")
+    return found, f"OECD observation {int(latest)}; fetched {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}"
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_te_yields():
