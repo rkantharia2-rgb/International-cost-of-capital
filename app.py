@@ -16,7 +16,7 @@ BETA_URL = "https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls"
 def fetch_industries():
     response = requests.get(BETA_URL, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
     response.raise_for_status()
-    raw = pd.read_excel(io.BytesIO(response.content), header=None, engine="xlrd")
+    raw = pd.read_excel(io.BytesIO(response.content), sheet_name="Industry Averages", header=None, engine="xlrd")
     header_index = None
     for i in range(min(25, len(raw))):
         row = [str(x).strip().lower() for x in raw.iloc[i].tolist()]
