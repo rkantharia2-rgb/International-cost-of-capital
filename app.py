@@ -30,76 +30,84 @@ BONDS_URL = "https://tradingeconomics.com/bonds"
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_oecd_tax_table():
-    # OECD 2024 table has complex multi-row headers; only accept clearly identified
-    # country/rate columns. If layout changes, fail safely rather than guess.
-    tables = pd.read_html(OECD_URL)
+    """Official OECD SDMX CSV: combined statutory CIT, general government, latest year."""
+    codes = {"United States":"USA","Canada":"CAN","United Kingdom":"GBR","Germany":"DEU",
+             "France":"FRA","Japan":"JPN","Australia":"AUS","Mexico":"MEX",
+             "Poland":"POL","Switzerland":"CHE","Ireland":"IRL","Netherlands":"NLD",
+             "Italy":"ITA","Spain":"ESP","Sweden":"SWE","Norway":"NOR",
+             "Denmark":"DNK","South Korea":"KOR","Portugal":"PRT","Colombia":"COL"}
+    url = "https://sdmx.oecd.org/public/rest/v1/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/" + "+".join(codes.values()) + ".A..ST..S13...?startPeriod=2025&endPeriod=2026"
+    response = requests.get(url, headers={"Accept":"csvfile","User-Agent":"InternationalCostOfCapital/1.0"}, timeout=30)
+    response.raise_for_status()
+    frame = pd.read_csv(io.StringIO(response.text))
+    required = {'REF_AREA','TIME_PERIOD','OBS_VALUE'}
+    if not required.issubset(frame.columns):
+        raise ValueError('OECD SDMX response did not include expected CSV columns')
+    frame['OBS_VALUE'] = pd.to_numeric(frame['OBS_VALUE'], errors='coerce')
+    frame['TIME_PERIOD'] = pd.to_numeric(frame['TIME_PERIOD'], errors='coerce')
+    frame = frame.dropna(subset=['OBS_VALUE','TIME_PERIOD']).sort_values('TIME_PERIOD')
+    reverse = {v:k for k,v in codes.items()}
     found = {}
-    for df in tables:
-        if len(df) < 10: continue
-        df.columns = [" ".join(map(str, c)) if isinstance(c,tuple) else str(c) for c in df.columns]
-        cols = list(df.columns)
-        name_cols = [c for c in cols if any(w in c.lower() for w in ('jurisdiction','country','economy'))]
-        rate_cols = [c for c in cols if 'combined' in c.lower() and ('rate' in c.lower() or 'statutory' in c.lower())]
-        if not name_cols or not rate_cols: continue
-        for _, row in df.iterrows():
-            name = str(row[name_cols[0]]).strip()
-            raw = str(row[rate_cols[0]]).replace('%','').strip()
-            try: val = float(raw)
-            except ValueError: continue
-            if name in TAX_FALLBACK and 0 <= val <= 60: found[name] = val
-    if len(found) < 5: raise ValueError('OECD table layout did not yield enough verified country/rate pairs')
+    for code, group in frame.groupby('REF_AREA'):
+        if code in reverse:
+            value = float(group.iloc[-1]['OBS_VALUE'])
+            if 0 <= value <= 60: found[reverse[code]] = value
+    if 'United States' not in found: raise ValueError('OECD API did not return US combined statutory rate')
     return found, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_te_yields():
-    # Trading Economics publishes a country/yield table at /bonds.
-    # Parse named columns rather than assume the first number is the yield.
-    response = requests.get(BONDS_URL,timeout=25,headers={'User-Agent':'Mozilla/5.0'})
-    response.raise_for_status()
-    tables = pd.read_html(io.StringIO(response.text))
+    """Extract 10Y yields from Trading Economics individual government bond pages.
+    Fail closed on pages without a verifiable labelled quote.
+    """
     found = {}
-    for df in tables:
-        df.columns = [' '.join(map(str,c)) if isinstance(c,tuple) else str(c) for c in df.columns]
-        cols = list(df.columns)
-        bond_cols = [c for c in cols if 'bond' in c.lower() or 'country' in c.lower()]
-        yield_cols = [c for c in cols if c.lower().strip() in ('yield','last','price')]
-        if not bond_cols or not yield_cols: continue
-        for _, row in df.iterrows():
-            label = str(row[bond_cols[0]]).strip()
-            for country in TAX_FALLBACK:
-                if country.lower() in label.lower() and ('10y' in label.lower() or '10-year' in label.lower() or '10 year' in label.lower()):
-                    try: val=float(str(row[yield_cols[0]]).replace('%','').replace(',',''))
-                    except ValueError: continue
-                    if -5 < val < 50: found[country] = val
-    if 'United States' not in found: raise ValueError('Could not verify US 10-year yield from Trading Economics table')
+    for country in TAX_FALLBACK:
+        slug = TE_SLUGS.get(country, country.lower().replace(' ', '-'))
+        url = f'https://tradingeconomics.com/{slug}/government-bond-yield'
+        try:
+            response = requests.get(url, timeout=12, headers={'User-Agent':'Mozilla/5.0 (compatible; educational research)'})
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+            title = soup.title.get_text(' ', strip=True) if soup.title else ''
+            if '10 year' not in title.lower() and '10-year' not in title.lower():
+                continue
+            # TE page's first summary card: heading 'Actual' followed by numeric quote.
+            actual = soup.find(string=re.compile(r'^\s*Actual\s*$', re.I))
+            if actual is None: continue
+            container = actual.parent
+            value = None
+            for parent in [container, container.parent, container.parent.parent if container.parent else None]:
+                if parent is None: continue
+                txt = parent.get_text(' ', strip=True)
+                match = re.search(r'\bActual\s+(-?\d{1,2}\.\d{1,5})\b', txt, re.I)
+                if match:
+                    value = float(match.group(1)); break
+            if value is not None and -5 < value < 50:
+                found[country] = value
+        except (requests.RequestException, ValueError, AttributeError):
+            continue
+    if 'United States' not in found:
+        raise ValueError('Could not extract a verified US 10-year yield from Trading Economics')
     return found, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-
 
 RATINGS_URL = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html"
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_bbb_spread():
-    """Extract Baa2/BBB large non-financial firms spread; fail closed if ambiguous."""
-    response = requests.get(RATINGS_URL, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+    """Parse large non-financial firms Baa2/BBB row (first spread column)."""
+    response = requests.get(RATINGS_URL, timeout=25, headers={'User-Agent':'Mozilla/5.0'})
     response.raise_for_status()
-    tables = pd.read_html(io.StringIO(response.text))
-    for table in tables:
-        rows = table.astype(str).values.tolist()
-        for row in rows:
-            line = " ".join(map(str, row)).lower()
-            if ('baa2' in line or 'bbb' in line) and ('baa2' in line or 'bbb' in line):
-                # Ratings table may contain multiple company-size spreads. Accept only
-                # a table with an explicitly identified large-company spread column.
-                columns = [" ".join(map(str, c)).lower() if isinstance(c, tuple) else str(c).lower() for c in table.columns]
-                large = [i for i,c in enumerate(columns) if 'large' in c and ('spread' in c or 'company' in c or 'firm' in c)]
-                if not large: continue
-                for i in large:
-                    cell = str(row[i]).strip().replace('%','').replace(',','')
-                    try: value = float(cell)
-                    except ValueError: continue
+    soup = BeautifulSoup(response.text, 'html.parser')
+    for row in soup.find_all('tr'):
+        cells = [c.get_text(' ', strip=True) for c in row.find_all(['td','th'])]
+        for i, cell in enumerate(cells):
+            if re.search(r'\bBaa2\s*/\s*BBB\b', cell, re.I) and i + 1 < len(cells):
+                match = re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*%\s*', cells[i+1])
+                if match:
+                    value = float(match.group(1))
                     if 0 < value < 15:
                         return value, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-    raise ValueError('Could not uniquely identify BBB spread for large non-financial firms')
+    raise ValueError('Baa2/BBB spread row was not found in Damodaran table')
 
 BETA_URL = "https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls"
 
@@ -175,7 +183,7 @@ except Exception as exc:
 
 chosen_tax_country = "United States" if tax_basis == "United States" else country
 tax_auto = live_taxes.get(chosen_tax_country, TAX_FALLBACK.get(chosen_tax_country))
-tax_origin = ("OECD 2024 webpage, fetched " + tax_fetched) if chosen_tax_country in live_taxes else "2026 lecture snapshot (not live OECD)"
+tax_origin = ("OECD SDMX API, fetched " + tax_fetched) if chosen_tax_country in live_taxes else "2026 lecture snapshot (not live OECD)"
 us_yield_auto = live_yields.get("United States", YIELD_FALLBACK.get("United States"))
 foreign_yield_auto = live_yields.get(country, YIELD_FALLBACK.get(country))
 
