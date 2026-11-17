@@ -1,6 +1,7 @@
 import io
 import re
 from bs4 import BeautifulSoup
+import numpy as np
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -9,7 +10,7 @@ import streamlit as st
 
 st.set_page_config(page_title="International Cost of Capital", layout="wide")
 st.title("International Cost of Capital")
-st.caption("Stage 3 · Select a country, tax rate and 10-year government yields")
+st.caption("International calculator · live-source attempts, dated fallbacks and independent checks")
 
 # Tax fallback is from Professor Rebelo's 2026 lecture, slide 550.
 # Never label fallback rates as live OECD downloads.
@@ -73,6 +74,33 @@ def fetch_te_yields():
     if 'United States' not in found: raise ValueError('Could not verify US 10-year yield from Trading Economics table')
     return found, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
+
+RATINGS_URL = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html"
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_bbb_spread():
+    """Extract Baa2/BBB large non-financial firms spread; fail closed if ambiguous."""
+    response = requests.get(RATINGS_URL, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+    response.raise_for_status()
+    tables = pd.read_html(io.StringIO(response.text))
+    for table in tables:
+        rows = table.astype(str).values.tolist()
+        for row in rows:
+            line = " ".join(row).lower()
+            if ('baa2' in line or 'bbb' in line) and ('baa2' in line or 'bbb' in line):
+                # Ratings table may contain multiple company-size spreads. Accept only
+                # a table with an explicitly identified large-company spread column.
+                columns = [" ".join(map(str, c)).lower() if isinstance(c, tuple) else str(c).lower() for c in table.columns]
+                large = [i for i,c in enumerate(columns) if 'large' in c and ('spread' in c or 'company' in c or 'firm' in c)]
+                if not large: continue
+                for i in large:
+                    cell = str(row[i]).strip().replace('%','').replace(',','')
+                    try: value = float(cell)
+                    except ValueError: continue
+                    if 0 < value < 15:
+                        return value, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    raise ValueError('Could not uniquely identify BBB spread for large non-financial firms')
+
 BETA_URL = "https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls"
 
 
@@ -110,6 +138,7 @@ with st.sidebar:
         fetch_industries.clear()
         fetch_oecd_tax_table.clear()
         fetch_te_yields.clear()
+        fetch_bbb_spread.clear()
         st.rerun()
 
 try:
@@ -150,6 +179,12 @@ tax_origin = ("OECD 2024 webpage, fetched " + tax_fetched) if chosen_tax_country
 us_yield_auto = live_yields.get("United States", YIELD_FALLBACK.get("United States"))
 foreign_yield_auto = live_yields.get(country, YIELD_FALLBACK.get(country))
 
+try:
+    bbb_auto, bbb_fetched = fetch_bbb_spread()
+    bbb_error = None
+except Exception as exc:
+    bbb_auto, bbb_fetched, bbb_error = 1.5, None, str(exc)
+
 with st.sidebar:
     beta_override = st.toggle("Override unlevered beta", value=False)
     beta_manual = st.number_input("Manual unlevered beta", min_value=0.0, value=0.80, step=0.05,
@@ -169,7 +204,10 @@ with st.sidebar:
     foreign_yield_pct = (st.number_input(f"{country} 10-year yield (%)", value=float(foreign_yield_auto or 4.9), step=0.1, key=f"yield_{country}")
                          if foreign_override_yield else foreign_yield_auto)
     st.caption("Yield source: Trading Economics live table where available; otherwise Nov 6, 2026 lecture snapshot. Missing values require manual override.")
-    usd_spread_pct = st.number_input("USD BBB borrowing spread (percentage points)", min_value=0.0, value=1.5, step=0.1)
+    usd_spread_override = st.toggle("Override USD BBB borrowing spread", value=False)
+    usd_spread_pct = st.number_input("USD BBB borrowing spread (percentage points)", min_value=0.0,
+                                     value=float(bbb_auto if bbb_auto is not None else 1.5), step=0.1,
+                                     disabled=not usd_spread_override) if usd_spread_override else bbb_auto
     foreign_override = st.toggle("Override selected-country borrowing spread", value=False)
     foreign_spread_pct = st.number_input("Selected-country borrowing spread (percentage points)", min_value=0.0,
                                           value=1.5, step=0.1, disabled=not foreign_override)
@@ -189,8 +227,8 @@ def calculate(beta_u, d, tax, erp, rf_us, rf_foreign, spread_us, spread_foreign=
                 rd_foreign=rd_foreign, spread_foreign=spread_f, wacc_us=wacc_us,
                 wacc_foreign=wacc_foreign, factor=factor)
 
-if tax_pct is None or us_yield_pct is None or foreign_yield_pct is None:
-    st.error("A required source value is unavailable. Enable its manual override in the sidebar to continue.")
+if tax_pct is None or us_yield_pct is None or foreign_yield_pct is None or usd_spread_pct is None:
+    st.error("A required source value is unavailable. Enable its manual override in the sidebar to continue. In particular, enter the current BBB spread from Damodaran if automatic retrieval fails.")
     st.stop()
 
 r = calculate(beta_u, debt_pct / 100, tax_pct / 100, erp_pct / 100,
@@ -224,4 +262,54 @@ st.write(f"Tax: {tax_origin}. U.S. yield: {'Trading Economics fetched '+yield_fe
          f"{country} yield: {'Trading Economics fetched '+yield_fetched if country in live_yields else 'lecture snapshot Nov 6, 2026' if country in YIELD_FALLBACK else 'manual'}.")
 if tax_error: st.warning(f"OECD live extraction unavailable: {tax_error}. Tax uses clearly labeled lecture fallback where available.")
 if yield_error: st.warning(f"Trading Economics live extraction unavailable: {yield_error}. Yields use dated lecture fallback where available.")
-st.caption("Source for industry beta: [Damodaran U.S. industry betas](https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls). BBB spread remains an illustrative lecture value (1.5%) until the next stage; override manually as needed.")
+st.markdown("Sources: [Damodaran industry betas](https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls) · [Damodaran BBB spread](https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html) · [OECD tax rates](https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html) · [Trading Economics bonds](https://tradingeconomics.com/bonds)")
+st.write(f"USD BBB spread: {'manual override' if usd_spread_override else 'Damodaran fetched '+bbb_fetched if bbb_fetched else 'illustrative fallback (1.5%, not current)'}. Foreign spread: {'manual override' if foreign_override else 'calculated by government-yield ratio'}.")
+if bbb_error: st.warning(f"Damodaran BBB extraction unavailable: {bbb_error}. An illustrative 1.5% fallback is used and labeled; enter the published spread using the manual override for a current result.")
+
+st.subheader("All-industry comparison")
+if 'industries' in globals():
+    rows = []
+    for _, item in industries.iterrows():
+        rr = calculate(float(item['Unlevered beta']), debt_pct/100, tax_pct/100,
+                       erp_pct/100, us_yield_pct/100, foreign_yield_pct/100,
+                       usd_spread_pct/100, foreign_spread_pct/100 if foreign_override else None)
+        rows.append({'Industry':item['Industry'], 'Unlevered beta':float(item['Unlevered beta']),
+                     'Levered beta':rr['beta_e'], 'USD equity cost (%)':100*rr['re_us'],
+                     'USD debt cost (%)':100*rr['rd_us'], 'USD WACC (%)':100*rr['wacc_us'],
+                     f'{country} equity cost (%)':100*rr['re_foreign'],
+                     f'{country} debt cost (%)':100*rr['rd_foreign'],
+                     f'{country} WACC (%)':100*rr['wacc_foreign']})
+    comparison = pd.DataFrame(rows)
+    st.dataframe(comparison, use_container_width=True, hide_index=True)
+    st.download_button("Download all-industry results (CSV)", comparison.to_csv(index=False).encode('utf-8'),
+                       'international_cost_of_capital_industries.csv', 'text/csv')
+    st.download_button("Download selected project results (CSV)",
+                       pd.DataFrame([{'Industry':industry,'Country':country,'Tax basis':chosen_tax_country,
+                        'Tax rate (%)':tax_pct,'Debt share (%)':debt_pct,'ERP (%)':erp_pct,
+                        'US yield (%)':us_yield_pct,'Foreign yield (%)':foreign_yield_pct,
+                        'USD BBB spread (%)':usd_spread_pct, 'Foreign BBB spread (%)':100*r['spread_foreign'],
+                        'USD cost of equity (%)':100*r['re_us'],'Foreign cost of equity (%)':100*r['re_foreign'],
+                        'USD cost of debt (%)':100*r['rd_us'],'Foreign cost of debt (%)':100*r['rd_foreign'],
+                        'USD WACC (%)':100*r['wacc_us'],'Foreign WACC (%)':100*r['wacc_foreign']}]).to_csv(index=False).encode('utf-8'),
+                        'international_cost_of_capital_selected.csv','text/csv')
+else:
+    st.warning('All-industry comparison requires a successful Damodaran beta download.')
+
+st.subheader("Verification checks")
+if st.button("Run independent consistency checks"):
+    baseline = calculate(.8,.3,.35,.065,.04,.12,.015)
+    equal = calculate(.8,.3,.35,.065,.04,.04,.015)
+    no_debt = calculate(.8,0,.35,.065,.04,.12,.015)
+    altered = calculate(.8,.3,.35,.065,.04,.12,.015,.05)
+    tests = {
+        'Lecture Colombia: USD WACC ≈ 8.5265%': abs(baseline['wacc_us']-.085265)<1e-6,
+        'Lecture Colombia: COP WACC ≈ 16.0670%': abs(baseline['wacc_foreign']-.160670)<1e-6,
+        'Equal yields → equal equity, debt and WACC': all(abs(equal[a]-equal[b])<1e-12 for a,b in [('re_us','re_foreign'),('rd_us','rd_foreign'),('wacc_us','wacc_foreign')]),
+        'Zero debt → WACC equals cost of equity in each currency': abs(no_debt['wacc_us']-no_debt['re_us'])<1e-12 and abs(no_debt['wacc_foreign']-no_debt['re_foreign'])<1e-12,
+        'Foreign spread override does not change USD results': all(abs(baseline[k]-altered[k])<1e-12 for k in ('re_us','rd_us','wacc_us')),
+    }
+    for label, passed in tests.items():
+        (st.success if passed else st.error)(f"{'PASS' if passed else 'FAIL'} — {label}")
+    st.caption('Tests use independently specified illustrative inputs, not live market data.')
+
+st.info('Model assumptions: U.S. industry beta proxies project operating risk; debt beta is zero; a single project tax rate and target debt share apply to both currencies; no extra country equity premium; government 10-year yields proxy risk-free rates; currency conversion uses gross-rate ratio (relative PPP/equal real rates).')
