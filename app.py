@@ -86,7 +86,7 @@ def fetch_bbb_spread():
     for table in tables:
         rows = table.astype(str).values.tolist()
         for row in rows:
-            line = " ".join(row).lower()
+            line = " ".join(map(str, row)).lower()
             if ('baa2' in line or 'bbb' in line) and ('baa2' in line or 'bbb' in line):
                 # Ratings table may contain multiple company-size spreads. Accept only
                 # a table with an explicitly identified large-company spread column.
